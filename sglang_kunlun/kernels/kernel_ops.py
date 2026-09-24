@@ -196,7 +196,7 @@ def dsv4_mqa_wo_a_einsum_kunlun(
     o: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
     """Run the DSV4 wo_a reduction with the Torch reference contraction."""
-
+   
     return torch.ops.xspeedgate_ops.einsum_tgd_grd_tgr(
         o.contiguous(),
         weight.contiguous(),
@@ -739,6 +739,8 @@ def dsv4_init_compression_metadata_kunlun(
         page_size,
         compute_page_indices,
     )
+    
+
 
 
 @plugin_hook(
@@ -797,7 +799,6 @@ def dsv4_expand_prefill_causally_kunlun(
         seq_lens_casual=seq_lens_casual,
         req_pool_indices_repeated=req_pool_indices_repeated,
     )
-
 
 import logging as _dsv4_logging
 
@@ -1065,7 +1066,6 @@ def dsv4_compressor_prefill_plan_kunlun(
 ):
     """dsv4_compressor_prefill_plan_kunlun"""
     from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
-
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
     if num_q_tokens < req_pool_indices.shape[0]:
@@ -1358,6 +1358,7 @@ def padded_to_bucket_kernel(
     out_ptr[:padded_bs].copy_(final.to(out_ptr.dtype))
 
 
+
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.compress", "compress_norm_rope_store"
 )
@@ -1384,127 +1385,28 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
 
     # The caller byte-views the pool buffer before calling
     # (``compressor_v2.forward_unified`` passes ``kv_cache.view(dtype=torch.uint8)``),
-    # so the dtype cannot identify the layout: bf16/fp16 (1024 B/token), fp8 (584)
-    # and int8 (604) all arrive as uint8. The stride is what identifies the int8
-    # layout -- ``kv.shape[-1] == 512`` (448 nope + 64 rope) also holds for fp16/bf16.
+    # so the dtype cannot identify the layout. The supported layouts here are
+    # bf16/fp16 (1024 B/token) and int8 mixed (604 B/token); the stride identifies
+    # the int8 layout. ``kv.shape[-1] == 512`` (448 nope + 64 rope) also holds for
+    # the bf16/fp16 input path.
     int8_mixed_cache = kvcache.shape[1] == page_size * dsv4_mixed_kv.STRIDE
 
     if int8_mixed_cache and kv.shape[-1] != (
         dsv4_mixed_kv.NOPE_DIM + dsv4_mixed_kv.ROPE_DIM
     ):
-        # Falling through would hand an int8 buffer to the fp8 op below, which
-        # writes [nope fp8 | rope bf16 | ue8m0 scale] (584 B/token). Those bytes
-        # dequantise to garbage instead of failing, so refuse instead.
+        # Falling through would hand an int8 buffer to the non-int8 store path,
+        # which writes a different layout. Those bytes would dequantise to
+        # garbage instead of failing, so refuse instead.
         raise ValueError(
             f"int8 mixed KV cache ({dsv4_mixed_kv.STRIDE} B/token) but the "
             f"compressor produced {kv.shape[-1]} columns, expected "
             f"{dsv4_mixed_kv.NOPE_DIM + dsv4_mixed_kv.ROPE_DIM}"
         )
 
-    if int8_mixed_cache:
-        import kunlun_ops
-
-        normalized = kv.to(torch.bfloat16).contiguous().clone()
-        plan_i32 = plan_raw.view(torch.int32)
-        seq_lens = plan_i32[:, 0]
-        num_rows = plan_i32.shape[0]
-
-        # Mirror ``fused_norm_rope_v2`` -- the op the fp16/bf16 path runs -- row
-        # for row: nothing is stored for a row the compressor did not produce, and
-        # the RoPE position is ``seq_len - compress_ratio``.
-        if plan.is_decode:
-            # v2 DecodePlan = {seq_len, write_loc, read_page_0, read_page_1}.
-            # mode=1 wants ``int32[n] = seq_len`` and derives both the row
-            # (``work_id``) and the rotation position (``seq_len - ratio``) itself,
-            # exactly like ``fused_norm_rope_v2``, so the first word is already the
-            # handle we owe the kernel.  The destination is ``out_loc[work_id]``,
-            # which ``_init_compressed_attn_metadata_kernel`` leaves at 0 whenever
-            # ``seq_len % compress_ratio != 0``.
-            storable = seq_lens.remainder(plan.compress_ratio) == 0
-            loc = out_loc.to(torch.int64)[:num_rows]
-            handle = seq_lens.contiguous()
-        else:
-            # v2 CompressPlan = {seq_len, ragged_id | buffer_len, read_page_0,
-            # read_page_1}, whereas mode=0 wants the v1 PrefillPlan = {ragged_id,
-            # batch_id, position, window_len}.  Both are 16 bytes, so handing
-            # ``plan[1]`` over made the kernel read ``seq_len`` as a row index
-            # (writing out of bounds) and ``read_page_0`` as a RoPE position.  The
-            # three fields it really needs:
-            #   dst      = ``out_loc[ragged_id]``; ``is_invalid()`` is seq_len == -1
-            #   row      = the work id (a negative row is the kernel's "skip me")
-            #   position = ``seq_len - 1``, because the kernel rotates by
-            #              ``position + 1 - ratio`` (``fused_norm_rope.cuh``) and
-            #              v1 defines ``position = seq_len - 1`` (``c4.cuh``).
-            #              Feeding the v2 ``seq_len`` -- or ``seq_len - ratio`` --
-            #              rotates ``ratio - 1`` too far.
-            storable = seq_lens != -1
-            loc = out_loc.to(torch.int64).index_select(
-                0,
-                plan_i32[:, 1]
-                .bitwise_and(0xFFFF)
-                .to(torch.int64)
-                .clamp(min=0, max=max(out_loc.shape[0] - 1, 0)),
-            )
-            handle = torch.zeros(
-                (num_rows, 4), dtype=torch.int32, device=plan_i32.device
-            )
-            handle[:, 0] = torch.where(
-                storable,
-                torch.arange(num_rows, dtype=torch.int32, device=plan_i32.device),
-                torch.full((), -1, dtype=torch.int32, device=plan_i32.device),
-            )
-            handle[:, 2] = torch.where(
-                storable, seq_lens - 1, torch.zeros_like(seq_lens)
-            )
-
-        kunlun_ops.dpsk_v4_norm_rope_gptj(
-            normalized,
-            norm_weight.to(normalized.dtype).contiguous(),
-            handle,
-            freq_cis,
-            1 if plan.is_decode else 0,
-            plan.compress_ratio,
-            norm_eps,
-        )
-
-        # A row that must not be stored is zeroed and sent to slot 0, which the
-        # paged allocator reserves for dummy writes (``allocator/paged.py::clear``
-        # starts free pages at 1).  The quantiser still leaves one denormal scale
-        # per group there, but the row dequantises to zero.  Keep this fixed-shape
-        # and sync-free for the same reason
-        # ``dsv4_fused_k_norm_rope_flashmla_kunlun`` does: a host sync or a
-        # data-dependent shape inside a graph capture freezes a stale row count.
-        normalized = torch.where(
-            storable.unsqueeze(-1),
-            normalized,
-            torch.zeros((), dtype=normalized.dtype, device=normalized.device),
-        )
-        loc = torch.where(
-            storable, loc, torch.zeros((), dtype=loc.dtype, device=loc.device)
-        )
-
-        flat = kvcache.view(torch.int8).reshape(-1, dsv4_mixed_kv.STRIDE)
-        loc_i32 = (
-            loc.clamp(min=0, max=flat.shape[0] - 1).to(torch.int32).contiguous()
-        )
-        kunlun_ops.quantize_mla_kv_cache_split(
-            normalized,
-            loc_i32,
-            flat,
-            dsv4_mixed_kv.NOPE_DIM,
-            dsv4_mixed_kv.ROPE_DIM,
-            dsv4_mixed_kv.GROUP_SIZE,
-        )
-        # ``quantize_mla_kv_cache_split`` emits [nope | scale | rope]; roll the
-        # tail into the [nope | rope | scale] order every reader derives from
-        # ``dsv4_mixed_kv``.
-        dsv4_mixed_kv.move_scale_to_tail(flat, loc_i32)
-        return
-
-    if kvcache.dtype == torch.int8:
+    if not int8_mixed_cache and kvcache.dtype == torch.int8:
         # An int8 pool whose stride the check above did not recognise (wrong
-        # ``page_size``, or a caller that does not byte-view its buffer). The fp8
-        # op below would write a different bytes-per-token format into it.
+        # ``page_size``, or a caller that does not byte-view its buffer). The
+        # non-int8 op below would write a different bytes-per-token format into it.
         raise ValueError(
             f"int8 KV cache buffer of stride {kvcache.shape[1]} with "
             f"page_size={page_size}, expected {page_size * dsv4_mixed_kv.STRIDE} "
@@ -1528,7 +1430,8 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
         plan.is_decode,
         plan.compress_ratio,
         page_size,
-        bf16_store,
+        False if int8_mixed_cache else bf16_store,
+        int8_mixed_cache,
     )
 
 
@@ -2989,65 +2892,14 @@ def dsv4_hash_topk_kunlun(
     return topk_weights, topk_ids
 
 
-# kunlun_ops.matmul writes an fp32 result directly for these input dtype pairs.
-_DSV4_MATMUL_FP32_OUT_INPUTS = frozenset(
-    (
-        (torch.bfloat16, torch.bfloat16),
-        (torch.bfloat16, torch.float32),
-        (torch.float32, torch.float32),
-    )
-)
-# fp16 has no fp32-output kernel ("matmul unimplemented"). Its fp16-output
-# kernel still accumulates in fp32, so only the result is rounded, and both
-# input casts are still skipped.
-_DSV4_MATMUL_FP16_OUT_INPUTS = frozenset(((torch.float16, torch.float16),))
-
-
-def _dsv4_kunlun_matmul_out_dtype(
-    x: torch.Tensor, y: torch.Tensor
-) -> Optional[torch.dtype]:
-    """Return the kunlun_ops.matmul output dtype for x @ y.T, or None to fall back."""
-
-    inputs = (x.dtype, y.dtype)
-    if inputs in _DSV4_MATMUL_FP32_OUT_INPUTS:
-        return torch.float32
-    if inputs in _DSV4_MATMUL_FP16_OUT_INPUTS:
-        return torch.float16
-    return None
-
-
 @register_jit_op("sglang.kernels.ops.attention.dsv4.gemm", "linear_bf16_fp32")
 def dsv4_linear_bf16_fp32_kunlun(
     x: torch.Tensor,
     y: torch.Tensor,
 ) -> torch.Tensor:
-    """Preserve the shared DSV4 FP32-output GEMM contract.
+    """Preserve the shared DSV4 FP32-output GEMM contract."""
 
-    kunlun_ops.matmul consumes the half-precision inputs as they are, so the two
-    .float() copies the torch fallback needs disappear. The weight copy is the
-    expensive one: the fallback re-materialises it on every forward.
-    """
-
-    out_dtype = _dsv4_kunlun_matmul_out_dtype(x, y)
-    if out_dtype is None:
-        result = torch.nn.functional.linear(x.float(), y.float())
-    else:
-        import kunlun_ops
-
-        out = torch.empty(
-            (x.shape[0], y.shape[0]), dtype=out_dtype, device=x.device
-        )
-        kunlun_ops.matmul(x, y, out, False, True)
-        result = out if out_dtype is torch.float32 else out.float()
-    return result
-
-
-def _resolve_silu_and_mul_with_swiglu_limit_out():
-    """Return the ``_out`` variant of the swiglu-limit activation, else None."""
-
-    return getattr(
-        torch.ops.xspeedgate_ops, "silu_and_mul_with_swiglu_limit_out", None
-    )
+    return torch.nn.functional.linear(x.float(), y.float())
 
 
 @register_jit_op("sglang.kernels.ops.attention.dsv4.moe", "silu_and_mul_clamp")
@@ -3056,18 +2908,6 @@ def dsv4_silu_and_mul_clamp_kunlun(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    """Apply clamped SiLU-and-mul into ``output``.
-
-    The ``_out`` variant writes the caller's buffer directly, so the allocation
-    of the kernel's own return tensor and the following ``output.copy_`` are
-    gone. Falls back to the allocating variant when unavailable.
-    """
-
-    op = _resolve_silu_and_mul_with_swiglu_limit_out()
-    if op is not None:
-        op(input, output, swiglu_limit)
-        return
-
     output.copy_(
         torch.ops.xspeedgate_ops.silu_and_mul_with_swiglu_limit(input, swiglu_limit)
     )
@@ -3218,106 +3058,6 @@ def set_mla_kv_buffer_kernel(
         loc,
         cache_k_nope.contiguous().view(cache_k_nope.shape[0], cache_k_nope.shape[-1]),
         cache_k_rope.contiguous().view(cache_k_rope.shape[0], cache_k_rope.shape[-1]),
-    )
-
-
-@register_jit_op("sglang.kernels.ops.kvcache.mla_buffer", "set_mla_kv_buffer_triton")
-def set_mla_kv_buffer_triton(
-    kv_buffer: torch.Tensor,
-    loc: torch.Tensor,
-    cache_k_nope: torch.Tensor,
-    cache_k_rope: Optional[torch.Tensor] = None,
-) -> None:
-    """Scatter MLA rows into the paged KV buffer.
-
-    Replaces the host wrapper rather than the kernel: upstream dispatches between
-    a Triton kernel and a TMA JIT kernel behind this one symbol, and neither can
-    run on P800. ``kunlun_ops`` takes exactly this signature.
-    """
-
-    from kunlun_ops import set_mla_kv_buffer_triton as impl
-
-    def _rows(x: torch.Tensor) -> torch.Tensor:
-        return x.contiguous().view(x.shape[0], x.shape[-1])
-
-    if cache_k_rope is None or cache_k_rope.numel() == 0:
-        # qk_rope_head_dim == 0 (or rope stored elsewhere): write the nope half
-        # only. The kunlun op always wants both halves, and XPU eager torch
-        # rejects `kv_buffer[loc, :w] = ...` (index_put INVALID PARAMETER), so go
-        # through gather / slice-assign / index_copy_, which are supported.
-        nope = _rows(cache_k_nope).to(kv_buffer.dtype)
-        loc_i64 = loc.to(torch.int64)
-        rows = kv_buffer.index_select(0, loc_i64)
-        rows.view(rows.shape[0], -1)[:, : nope.shape[-1]] = nope
-        kv_buffer.index_copy_(0, loc_i64, rows)
-        return
-
-    impl(kv_buffer, loc, _rows(cache_k_nope), _rows(cache_k_rope))
-
-
-@register_jit_op("sglang.kernels.ops.kvcache.mla_buffer", "get_mla_kv_buffer_triton")
-def get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope=None):
-    """Read side of the MLA KV buffer: gather rows ``loc`` into nope (+ rope).
-
-    Same op as ``get_mla_kv_buffer_kernel`` below, just hooked at the other
-    upstream module. ``cache_k_rope`` is a required (non-optional) tensor in the
-    op schema, but a zero-width one is accepted - which is what GLM-5-Next needs,
-    since ``qk_rope_head_dim == 0``. The torch fallback stays for the 3D
-    ``cache_k_nope`` layouts the op does not take.
-    """
-    if cache_k_nope.dim() == 2 and (cache_k_rope is None or cache_k_rope.dim() == 2):
-        rope = cache_k_rope
-        if rope is None:
-            rope = cache_k_nope.new_empty((cache_k_nope.shape[0], 0))
-        torch.ops.xspeedgate_ops.get_mla_kv_buffer(kv_buffer, loc, cache_k_nope, rope)
-        return
-
-    rows = kv_buffer.index_select(0, loc.to(torch.int64))
-    rows = rows.reshape(rows.shape[0], -1)
-    nope_dim = cache_k_nope.shape[-1]
-    cache_k_nope.copy_(rows[:, :nope_dim].reshape(cache_k_nope.shape))
-    if cache_k_rope is not None and cache_k_rope.numel() > 0:
-        rope_dim = cache_k_rope.shape[-1]
-        cache_k_rope.copy_(
-            rows[:, nope_dim : nope_dim + rope_dim].reshape(cache_k_rope.shape)
-        )
-
-
-@register_jit_op(
-    "sglang.kernels.ops.attention.dsa.index_buf_accessor", "_get_k_and_s_triton"
-)
-def _get_k_and_s_triton(
-    buf,
-    page_indices,
-    seq_lens,
-    seq_len_sum: int,
-    max_seq_len: int,
-    page_size: int,
-    index_head_dim: int,
-):
-    """Torch port of the fused paged gather of index keys + their fp32 scales.
-
-    Page layout: ``page_size * index_head_dim`` key bytes, then the per-slot
-    4-byte scales. Both outputs stay ``uint8`` (the caller reinterprets them).
-    """    
-    return torch.ops.xspeedgate_ops.get_k_and_s(
-                buf, page_indices, seq_lens, seq_len_sum, max_seq_len, page_size, index_head_dim
-    )
-
-
-
-@register_jit_op("sglang.kernels.ops.attention.dsa.triton_kernel", "get_valid_kv_indices")
-def get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs: int):
-    """Compact the non ``-1`` entries of each row into ``kv_indices``.
-
-    ``kv_indptr`` must be int32 per the op's contract; positions not covered by
-    a valid entry keep their previous value, matching the reference kernel.
-    """
-    torch.ops.xspeedgate_ops.get_valid_kv_indices(
-        page_table_1.contiguous(),
-        kv_indptr.to(torch.int32).contiguous(),
-        kv_indices,
-        bs,
     )
 
 
@@ -3843,42 +3583,6 @@ def assign_hidden_states_pool_triton(
         )
 
 
-_DSV4_C128_CLEANUP_CALLS = [0]
-
-
-def _dsv4_trace_c128_cleanup(
-    state, req_pool_indices, seq_lens, accept_lens, ring_size, num_draft_tokens
-) -> None:
-    """Log the first few rejected-draft C128 resets, including how much state was live."""
-    import os
-
-    if os.getenv("DSV4_C128_CLEANUP_TRACE", "0") != "1":
-        return
-    seen = _DSV4_C128_CLEANUP_CALLS[0]
-    if seen >= 8:
-        return
-    _DSV4_C128_CLEANUP_CALLS[0] = seen + 1
-    half = state.shape[-1] // 2
-    rid = req_pool_indices.to(torch.int64)[:1]
-    seq = seq_lens.to(torch.int64)[:1]
-    offsets = torch.arange(num_draft_tokens, dtype=torch.int64, device=state.device)
-    rows = (rid.unsqueeze(1) * ring_size + (seq.unsqueeze(1) + offsets).remainder(ring_size)).reshape(-1)
-    sample = state.index_select(0, rows)
-    live = (sample[:, half:] > float("-inf")).any(dim=-1)
-    logger.warning(
-        "[DSV4_C128_CLEANUP] call=%s bs=%s ring=%s nd=%s accept_lens=%s "
-        "req0_rows=%s req0_live_before=%s state_rows=%s",
-        seen,
-        int(req_pool_indices.numel()),
-        ring_size,
-        num_draft_tokens,
-        accept_lens.to("cpu").tolist()[: min(8, accept_lens.numel())],
-        rows.to("cpu").tolist(),
-        live.to("cpu").tolist(),
-        int(state.shape[0]),
-    )
-
-
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.c128_cleanup",
     "clear_unaccepted_c128_draft_states",
@@ -3897,9 +3601,6 @@ def clear_unaccepted_c128_draft_states_torch(
     batch_size = req_pool_indices.numel()
     if batch_size == 0 or num_draft_tokens == 0:
         return
-    _dsv4_trace_c128_cleanup(
-        state, req_pool_indices, seq_lens, accept_lens, ring_size, num_draft_tokens
-    )
 
     draft_offsets = torch.arange(
         num_draft_tokens,
@@ -4203,48 +3904,6 @@ def fill_accepted_out_cache_loc(
 
 
 @register_triton_op(
-    "sglang.kernels.ops.speculative.eagle", "nextn_mamba_commit_prologue"
-)
-def nextn_mamba_commit_prologue(
-    accept_lens: torch.Tensor,
-    seq_lens: torch.Tensor,
-    last_correct: torch.Tensor,
-    steps_to_track: torch.Tensor,
-    mamba_track_interval: int,
-    *,
-    HAS_TRACK: bool,
-    grid: tuple[int, ...] | None = None,
-) -> None:
-    """Chain-spec (topk == 1) mamba commit prologue.
-
-    ``accept_index[i, j] == i * draft + j`` for accepted slots, so the last
-    accepted tree step is ``accept_lens - 1`` and the interval-crossing
-    candidate step equals its own in-request index -- no gathers needed. Both
-    outputs are int32 like the reference kernel, and ``steps_to_track`` is only
-    written when ``HAS_TRACK``.
-    """
-
-    bs = int(grid[0]) if grid is not None else accept_lens.shape[0]
-    if bs == 0:
-        return
-
-    al = accept_lens[:bs].to(torch.int64)
-    last_correct[:bs] = (al - 1).to(torch.int32)
-    if not HAS_TRACK:
-        return
-
-    pre = seq_lens[:bs].to(torch.int64)
-    post = pre + al
-    interval = int(mamba_track_interval)
-    crossed = (pre // interval) != (post // interval)
-    tracking_point = (post // interval) * interval
-    ith = (tracking_point - pre - 1).clamp_min(0)
-    steps_to_track[:bs] = torch.where(
-        crossed, ith, torch.full_like(ith, -1)
-    ).to(torch.int32)
-
-
-@register_triton_op(
     "sglang.kernels.ops.speculative.cache_locs",
     "generate_draft_decode_kv_indices",
 )
@@ -4527,7 +4186,7 @@ def chain_speculative_sampling_triton(
 
     """Batched, sync-free chain rejection sampling.
 
-    Semantically identical to the row-by-row reference, but every decision
+    Semantically identical to the row-by-row reference below, but every decision
     stays on device. The reference walked ``bs`` rows in Python and called
     ``.item()`` about ten times per row (candidate id, coin comparison, retrieve
     index, ``norm_sum <= 0``, ``any()``, ``argmax``), so a batch of 32 issued
@@ -4648,7 +4307,6 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
         _DSV4_FREQS_REAL_CACHE[key] = cached
     return cached
 
-
 def _dsv4_rotate_gptj_tail(
     value: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -4681,7 +4339,6 @@ def _dsv4_rotate_gptj_tail(
     result = value.clone()
     result[..., -rope_dim:].copy_(rotated.reshape(rope_shape))
     return result
-
 
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.elementwise", "fused_rope_inplace"
@@ -4932,7 +4589,7 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
         )
         flat = kvcache.view(torch.int8).reshape(-1, dsv4_mixed_kv.STRIDE)
         loc_i32 = loc.to(torch.int32).contiguous()
-        kunlun_ops.quantize_mla_kv_cache_split(
+        kunlun_ops.quantize_mla_kv_cache_split_v2(
             committed_rotated,
             loc_i32,
             flat,
@@ -4940,7 +4597,6 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
             dsv4_mixed_kv.ROPE_DIM,
             dsv4_mixed_kv.GROUP_SIZE,
         )
-        dsv4_mixed_kv.move_scale_to_tail(flat, loc_i32)
         return
 
     if kvcache.dtype == torch.int8:
@@ -5229,163 +4885,3 @@ def _w8a8_block_int8_matmul(
     """w8a8 block int8 matmul kernel replacement."""
 
     raise NotImplementedError("w8a8_block_int8_matmul is not supported on Kunlun.")
-
-
-@register_triton_op(
-    "sglang.kernels.ops.speculative.cache_locs",
-    "get_target_cache_loc",
-)
-def get_target_cache_loc(
-    tgt_cache_loc: torch.Tensor,
-    to_free_slots: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    to_free_num_slots: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    num_verify_tokens: int,
-    num_verify_tokens_upper: int,
-    bs_upper: int,
-    *,
-    grid: tuple[int, ...] | None = None,
-) -> None:
-    """Split the verify block into kept slots and freed slots.
-
-    Per request ``i`` the op does two ragged copies out of the
-    ``[bs, num_verify_tokens]`` verify block:
-      * the accepted prefix ``num_correct_drafts[i] + 1`` slots go to
-        ``tgt_cache_loc`` at ``sum(num_correct_drafts[:i]) + i``;
-      * the trailing ``to_free_num_slots[i]`` slots go to ``to_free_slots`` at
-        ``sum(to_free_num_slots[:i])``.
-    ``num_verify_tokens_upper`` / ``bs_upper`` only exist to mirror the Triton
-    signature; the XPU implementation ignores them and takes ``bs`` explicitly
-    instead of reading it off the grid.
-    """
-
-    if grid is None:
-        raise ValueError("get_target_cache_loc requires Triton-style grid")
-    torch.ops.xspeedgate_ops.get_target_cache_loc(
-        tgt_cache_loc,
-        to_free_slots,
-        num_correct_drafts.contiguous(),
-        to_free_num_slots.contiguous(),
-        out_cache_loc,
-        num_verify_tokens,
-        num_verify_tokens_upper,
-        bs_upper,
-        int(grid[0]),
-    )
-
-
-@register_triton_op(
-    "sglang.kernels.ops.speculative.cache_locs",
-    "filter_finished_cache_loc_kernel",
-)
-def filter_finished_cache_loc_kernel(
-    out_cache_loc: torch.Tensor,
-    tgt_cache_loc: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    num_accept_tokens_filter: torch.Tensor,
-    bs_upper: int,
-    num_verify_tokens_upper: int,
-    *,
-    grid: tuple[int, ...] | None = None,
-) -> None:
-    """Compact ``tgt_cache_loc`` down to the not-yet-finished requests.
-
-    Row ``i`` lives at ``sum(num_correct_drafts[:i]) + i`` in the source and at
-    ``sum(num_accept_tokens_filter[:i])`` in the destination, and only
-    ``num_accept_tokens_filter[i]`` slots survive (0 for a finished request).
-    """
-
-    if grid is None:
-        raise ValueError("filter_finished_cache_loc_kernel requires Triton-style grid")
-    torch.ops.xspeedgate_ops.filter_finished_cache_loc_kernel(
-        out_cache_loc,
-        tgt_cache_loc.contiguous(),
-        num_correct_drafts.contiguous(),
-        num_accept_tokens_filter.contiguous(),
-        bs_upper,
-        num_verify_tokens_upper,
-        int(grid[0]),
-    )
-
-
-@register_triton_op(
-    "sglang.kernels.ops.speculative.cache_locs",
-    "rebuild_compact_draft_req_to_token",
-)
-def rebuild_compact_draft_req_to_token(
-    draft_req_to_token: torch.Tensor,
-    target_req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    suffix_start: torch.Tensor,
-    draft_prefix_lens: torch.Tensor,
-    verify_out_cache_loc: torch.Tensor,
-    verify_loc_stride: int,
-    draft_pool_len: int,
-    target_pool_len: int,
-    block_size: int,
-    *,
-    grid: tuple[int, ...] | None = None,
-) -> None:
-    """Rebuild each request's draft-local compact req->token row.
-
-    Row layout, matching the reference kernel: ``[0, prefix_len)`` is the
-    committed target suffix ``target_req_to_token[req, suffix_start:...]`` and
-    ``[prefix_len, prefix_len + block_size)`` is the verify block. Columns past
-    that are left untouched.
-
-    The op takes the three per-request index tensors as int64, so they are cast
-    here; it also assumes distinct ``req_pool_indices`` (one program per row).
-    """
-
-    if grid is None:
-        raise ValueError("rebuild_compact_draft_req_to_token requires Triton-style grid")
-
-    def _i64(t: torch.Tensor) -> torch.Tensor:
-        return t.to(torch.int64).contiguous()
-
-    torch.ops.xspeedgate_ops.rebuild_compact_draft_req_to_token(
-        draft_req_to_token,
-        target_req_to_token.contiguous(),
-        _i64(req_pool_indices),
-        _i64(suffix_start),
-        _i64(draft_prefix_lens),
-        verify_out_cache_loc.contiguous(),
-        verify_loc_stride,
-        draft_pool_len,
-        target_pool_len,
-        block_size,
-        int(grid[0]),
-    )
-
-
-@register_jit_op("sglang.kernels.ops.layernorm.fused_eh_norm", "fused_eh_norm")
-def fused_eh_norm_kunlun(
-    inputs_embeds: torch.Tensor,
-    previous_hidden: torch.Tensor,
-    enorm_weight: torch.Tensor,
-    hnorm_weight: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    """MTP draft head's ``cat(enorm(embeds), hnorm(prev_hidden))``, unfused.
-
-    The reference is a tvm-ffi JIT CUDA kernel, so it is not merely slow here --
-    it does not build: nvcc on this image rejects the ``-std=c++20`` the JIT
-    pipeline passes. Kunlun tensors report as CUDA, so ``deepseek_nextn.py``
-    takes the ``_is_cuda`` branch and calls it unconditionally.
-
-    Same two RMSNorms + concat as that file's non-CUDA fallback, but routed
-    through ``kunlun_ops.rmsnorm`` so the draft head's norm numerics match every
-    other norm in the model rather than a second torch formulation.
-    """
-
-    import kunlun_ops
-
-    e = inputs_embeds.contiguous()
-    h = previous_hidden.contiguous()
-    e_out = torch.empty_like(e)
-    h_out = torch.empty_like(h)
-    if e.shape[0] != 0:
-        kunlun_ops.rmsnorm(e, enorm_weight, e_out, eps, False, True, None, None, None)
-        kunlun_ops.rmsnorm(h, hnorm_weight, h_out, eps, False, True, None, None, None)
-    return torch.cat((e_out, h_out), dim=-1)

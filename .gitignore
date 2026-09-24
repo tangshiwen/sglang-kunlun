@@ -52,3 +52,6 @@ coverage.xml
 # Sphinx documentation
 /docs/_build/
 
+# Docker build configs (内部镜像源,勿提交)
+/dockerfile/pip.conf
+/dockerfile/sources.list

@@ -13,7 +13,6 @@ from sglang_kunlun.kernels.dsv4_mixed_kv import (
     NOPE_DIM as _INT8_NOPE_DIM,
     ROPE_DIM as _INT8_ROPE_DIM,
     STRIDE as _INT8_STRIDE,
-    move_scale_to_tail,
 )
 
 # DSV4-Flash int8 mixed tiling: 448 nope + 64 rope, nope quantized in groups
@@ -97,7 +96,7 @@ def _set_k_and_s_triton(
         loc_i32 = (
             loc.clamp(min=0, max=flat.shape[0] - 1).to(torch.int32).contiguous()
         )
-        kunlun_ops.quantize_mla_kv_cache_split(
+        kunlun_ops.quantize_mla_kv_cache_split_v2(
             packed,
             loc_i32,
             flat,
@@ -105,10 +104,6 @@ def _set_k_and_s_triton(
             _INT8_ROPE_DIM,
             _INT8_GROUP_SIZE,
         )
-        # The kernel emits nope(int8) + scale first and rope(bf16) after it, so
-        # that tail has to be rotated into the [nope 448][rope 128][scale 28]
-        # order ``mixed_int8_bytes_per_token`` defines.
-        move_scale_to_tail(flat, loc_i32)
         return
     assert k_val.dtype in (torch.bfloat16, torch.float16), (
         f"in this kernel, kv dtype is bf16/fp16, got {k_val.dtype}"

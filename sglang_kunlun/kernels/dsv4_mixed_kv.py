@@ -55,38 +55,6 @@ ROPE_END = STRIDE - SCALE_BYTES
 ROPE_BYTES = ROPE_END - NOPE_DIM
 
 
-def move_scale_to_tail(flat: torch.Tensor, loc: torch.Tensor) -> None:
-    """Roll ``quantize_mla_kv_cache_split``'s tail into the reader's order.
-
-    The quantiser writes ``[nope | scale | rope]`` while every reader in this
-    tree derives ``[nope | rope | scale]`` from this module, so the
-    ``ROPE_BYTES + SCALE_BYTES`` tail of each stored row has to roll right by
-    ``SCALE_BYTES``.
-
-    Do it through a plain whole-row gather/scatter (``flat[loc]``) rather than
-    two column-sliced writes into the pool. Measured on XPU at 1072 rows and at
-    a single row, the width-sliced ``flat[loc, NOPE_DIM:STRIDE]`` form costs
-    ~1.7x-1.8x a whole-row gather + scatter of the same call; the row pitch
-    being 604 B (not a multiple of 64) did not show up at all, and neither did
-    the extra ~300 B/row of re-stored prefix. So this is a win in both prefill
-    and decode, and it is a win even for one row.
-
-    ``flat`` is the pool byte-viewed as ``[-, STRIDE]`` and only rows in ``loc``
-    are touched. Re-storing the untouched ``[0, NOPE_DIM)`` prefix is a no-op:
-    the caller has just written those rows (the quantiser runs immediately
-    before, on the same stream) and nothing else writes them in between.
-    """
-    if flat.ndim != 2 or flat.shape[-1] != STRIDE:
-        raise ValueError(
-            f"expected [N, {STRIDE}] int8 cache, got {tuple(flat.shape)}"
-        )
-    row = flat[loc]
-    tail = row[:, NOPE_DIM:STRIDE].clone()
-    row[:, NOPE_DIM:ROPE_END] = tail[:, SCALE_BYTES:]
-    row[:, ROPE_END:STRIDE] = tail[:, :SCALE_BYTES]
-    flat[loc] = row
-
-
 def unpack_mixed_int8(cache: torch.Tensor) -> torch.Tensor:
     """Dequantize a packed mixed int8 cache back to dense bf16 ``[N, 512]``.
 
